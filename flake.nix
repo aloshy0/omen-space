@@ -35,7 +35,7 @@
             ];
 
             buildPhase = ''
-              for crate in omen-space-daemon omen-cli omen-tray omen-gui; do
+              for crate in omen-space-daemon omen-cli omen-tray omen-gui omen-overlay; do
                 cargo build --release --manifest-path src/$crate/Cargo.toml
               done
             '';
@@ -44,6 +44,7 @@
               mkdir -p $out/libexec/omen-space
               mkdir -p $out/bin
               mkdir -p $out/lib/systemd/system
+              mkdir -p $out/lib/systemd/user
               mkdir -p $out/lib/sysusers.d
               mkdir -p $out/lib/udev/rules.d
               mkdir -p $out/share/dbus-1/system.d
@@ -51,18 +52,24 @@
               mkdir -p $out/share/applications
               mkdir -p $out/share/pixmaps
               mkdir -p $out/share/omen-space/assets
+              mkdir -p $out/etc/xdg/autostart
 
               cp target/*/release/omen-space-daemon $out/libexec/omen-space/omen-space-daemon || cp target/release/omen-space-daemon $out/libexec/omen-space/omen-space-daemon
               cp target/*/release/omen-cli $out/bin/ || cp target/release/omen-cli $out/bin/
               cp target/*/release/omen-tray $out/bin/ || cp target/release/omen-tray $out/bin/
               cp target/*/release/omen-gui $out/bin/ || cp target/release/omen-gui $out/bin/
+              cp target/*/release/omen-overlay $out/bin/ || cp target/release/omen-overlay $out/bin/
 
               cp data/omen-space-daemon.service $out/lib/systemd/system/
+              cp data/omen-overlay.service $out/lib/systemd/user/
               cp data/sysusers.d/omen-space.conf $out/lib/sysusers.d/
               cp data/99-omen-space.rules $out/lib/udev/rules.d/
               cp data/org.hp.omen.conf $out/share/dbus-1/system.d/
               cp data/org.hp.OmenSpace.desktop $out/share/applications/
+              cp data/omenspace-overlay.desktop $out/share/applications/org.hp.OmenOverlay.desktop
+              cp data/omenspace-overlay.desktop $out/etc/xdg/autostart/
               cp data/org.hp.OmenSpace.service $out/share/dbus-1/services/
+              cp data/org.hp.omen.Overlay.service $out/share/dbus-1/services/
               cp src/omen-gui/assets/omenspace.png $out/share/pixmaps/
               cp -r src/omen-gui/assets/* $out/share/omen-space/assets/
 

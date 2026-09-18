@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=OMEN Space Overlay
+Comment=OMEN Space Shift+F2 Quick HUD Overlay Daemon
+Exec=/usr/bin/omen-overlay --daemon
+Icon=omenspace
+Terminal=false
+Type=Application
+Categories=Utility;System;
+X-GNOME-Autostart-enabled=true
+StartupNotify=false
+NoDisplay=true

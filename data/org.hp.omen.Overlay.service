@@ -1,0 +1,3 @@
+[D-BUS Service]
+Name=org.hp.omen.Overlay
+Exec=/usr/bin/omen-overlay --daemon

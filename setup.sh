@@ -202,6 +202,7 @@ do_install() {
     systemctl stop omen-space-daemon.service 2>/dev/null || true
     killall omen-tray 2>/dev/null || true
     killall omen-gui 2>/dev/null || true
+    killall omen-overlay 2>/dev/null || true
 
     echo "====================================="
     echo " Installing system files"
@@ -210,6 +211,7 @@ do_install() {
     mkdir -p /etc/omen-space
     mkdir -p /etc/dbus-1/system.d
     mkdir -p /etc/systemd/system
+    mkdir -p /usr/lib/systemd/user
     mkdir -p /usr/lib/sysusers.d
     mkdir -p /usr/lib/udev/rules.d
     mkdir -p /usr/bin
@@ -249,11 +251,14 @@ do_install() {
 
     install -m 644 data/org.hp.omen.conf /etc/dbus-1/system.d/
     install -m 644 data/omen-space-daemon.service /etc/systemd/system/
+    install -m 644 data/omen-overlay.service /usr/lib/systemd/user/
     install -m 644 data/sysusers.d/omen-space.conf /usr/lib/sysusers.d/
     install -m 644 data/99-omen-space.rules /usr/lib/udev/rules.d/
     rm -f /usr/share/applications/omen-space.desktop /usr/share/applications/org.hp.OmenSpace.desktop
     cp data/org.hp.OmenSpace.desktop /usr/share/applications/
     cp data/org.hp.OmenSpace.service /usr/share/dbus-1/services/
+    cp data/org.hp.omen.Overlay.service /usr/share/dbus-1/services/
+    cp data/omenspace-overlay.desktop /usr/share/applications/org.hp.OmenOverlay.desktop
     mkdir -p /usr/share/icons/hicolor/512x512/apps
     cp src/omen-gui/assets/omenspace.png /usr/share/icons/hicolor/512x512/apps/omenspace.png
     cp src/omen-gui/assets/omenspace.png /usr/share/pixmaps/omenspace.png
@@ -270,6 +275,8 @@ Terminal=false
 Type=Application
 Categories=Utility;
 EOF
+
+    install -m 644 data/omenspace-overlay.desktop /etc/xdg/autostart/omenspace-overlay.desktop
 
     echo "Creating system users and reloading udev rules..."
     systemd-sysusers || true
@@ -293,6 +300,8 @@ EOF
     echo " Starting omen-space-daemon service"
     echo "====================================="
     systemctl daemon-reload
+    systemctl --global daemon-reload 2>/dev/null || true
+    systemctl --global enable omen-overlay.service 2>/dev/null || true
     systemctl reload dbus || true
     systemctl enable --now omen-space-daemon.service
 
@@ -308,12 +317,18 @@ EOF
         echo -e "\n❌ ERROR: CLI failed to communicate with the daemon. Check 'systemctl status omen-space-daemon'."
     fi
 
-    if [ -n "$SUDO_USER" ] && [ -x /usr/bin/omen-tray ]; then
+    if [ -n "$SUDO_USER" ]; then
         local user_id
         user_id=$(id -u "$SUDO_USER")
         if [ -d "/run/user/$user_id" ]; then
-            echo "Starting omen-tray for $SUDO_USER..."
-            su - "$SUDO_USER" -c "DISPLAY=${DISPLAY:-:0} WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-wayland-0} XDG_RUNTIME_DIR=/run/user/$user_id /usr/bin/omen-tray >/dev/null 2>&1 &" || true
+            if [ -x /usr/bin/omen-overlay ]; then
+                echo "Starting omen-overlay for $SUDO_USER..."
+                su - "$SUDO_USER" -c "DISPLAY=\${DISPLAY:-:0} WAYLAND_DISPLAY=\${WAYLAND_DISPLAY:-wayland-0} XDG_RUNTIME_DIR=/run/user/$user_id /usr/bin/omen-overlay --daemon >/dev/null 2>&1 &" || true
+            fi
+            if [ -x /usr/bin/omen-tray ]; then
+                echo "Starting omen-tray for $SUDO_USER..."
+                su - "$SUDO_USER" -c "DISPLAY=\${DISPLAY:-:0} WAYLAND_DISPLAY=\${WAYLAND_DISPLAY:-wayland-0} XDG_RUNTIME_DIR=/run/user/$user_id /usr/bin/omen-tray >/dev/null 2>&1 &" || true
+            fi
         fi
     fi
 
@@ -332,12 +347,15 @@ do_uninstall() {
     killall omen-gui 2>/dev/null || true
     killall omen-overlay 2>/dev/null || true
     systemctl disable omen-space-daemon.service 2>/dev/null || true
+    systemctl --global disable omen-overlay.service 2>/dev/null || true
 
     rm -rf /usr/libexec/omen-space
     rm -rf /etc/omen-space
     rm -rf /var/lib/omen-space /var/lib/omen-space-daemon
     rm -f /etc/dbus-1/system.d/org.hp.omen.conf
     rm -f /etc/systemd/system/omen-space-daemon.service
+    rm -f /usr/lib/systemd/user/omen-overlay.service
+    rm -f /etc/systemd/user/omen-overlay.service
     rm -f /usr/lib/sysusers.d/omen-space.conf
     rm -f /usr/lib/udev/rules.d/99-omen-space.rules
 
@@ -349,13 +367,17 @@ do_uninstall() {
     rm -rf /usr/share/omen-space
     rm -f /usr/share/applications/omen-space.desktop
     rm -f /usr/share/applications/org.hp.OmenSpace.desktop
+    rm -f /usr/share/applications/org.hp.OmenOverlay.desktop
     rm -f /usr/share/dbus-1/services/org.hp.OmenSpace.service
+    rm -f /usr/share/dbus-1/services/org.hp.omen.Overlay.service
     rm -f /usr/share/pixmaps/omenspace.png
     rm -f /usr/share/icons/hicolor/512x512/apps/omenspace.png
     gtk-update-icon-cache -f -t /usr/share/icons/hicolor || true
     rm -f /etc/xdg/autostart/omenspace-tray.desktop
+    rm -f /etc/xdg/autostart/omenspace-overlay.desktop
 
     systemctl daemon-reload
+    systemctl --global daemon-reload 2>/dev/null || true
     systemctl reload dbus || true
     udevadm control --reload-rules || true
 

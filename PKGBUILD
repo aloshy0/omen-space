@@ -33,6 +33,7 @@ package() {
   mkdir -p "$pkgdir/etc/omen-space"
   mkdir -p "$pkgdir/etc/dbus-1/system.d"
   mkdir -p "$pkgdir/usr/lib/systemd/system"
+  mkdir -p "$pkgdir/usr/lib/systemd/user"
   mkdir -p "$pkgdir/usr/lib/sysusers.d"
   mkdir -p "$pkgdir/usr/lib/udev/rules.d"
   mkdir -p "$pkgdir/usr/bin"
@@ -48,21 +49,25 @@ package() {
   cp target/release/omen-cli "$pkgdir/usr/bin/"
   cp target/release/omen-tray "$pkgdir/usr/bin/"
   cp target/release/omen-gui "$pkgdir/usr/bin/"
+  cp target/release/omen-overlay "$pkgdir/usr/bin/"
 
   # System configuration files
   cp data/org.hp.omen.conf "$pkgdir/etc/dbus-1/system.d/"
   cp data/omen-space-daemon.service "$pkgdir/usr/lib/systemd/system/"
+  cp data/omen-overlay.service "$pkgdir/usr/lib/systemd/user/"
   cp data/sysusers.d/omen-space.conf "$pkgdir/usr/lib/sysusers.d/"
   cp data/99-omen-space.rules "$pkgdir/usr/lib/udev/rules.d/"
 
   # Desktop integration and assets
   cp data/org.hp.OmenSpace.desktop "$pkgdir/usr/share/applications/"
+  cp data/omenspace-overlay.desktop "$pkgdir/usr/share/applications/org.hp.OmenOverlay.desktop"
   cp data/org.hp.OmenSpace.service "$pkgdir/usr/share/dbus-1/services/"
+  cp data/org.hp.omen.Overlay.service "$pkgdir/usr/share/dbus-1/services/"
   cp src/omen-gui/assets/omenspace.png "$pkgdir/usr/share/pixmaps/omenspace.png"
   cp src/omen-gui/assets/omenspace.png "$pkgdir/usr/share/icons/hicolor/512x512/apps/omenspace.png"
   cp -r src/omen-gui/assets/* "$pkgdir/usr/share/omen-space/assets/"
 
-  # Autostart tray
+  # Autostart tray and overlay
   cat <<EOF > "$pkgdir/etc/xdg/autostart/omenspace-tray.desktop"
 [Desktop Entry]
 Name=OMENSpace Tray
@@ -73,6 +78,8 @@ Terminal=false
 Type=Application
 Categories=Utility;
 EOF
+
+  cp data/omenspace-overlay.desktop "$pkgdir/etc/xdg/autostart/omenspace-overlay.desktop"
 
   # DKMS Driver
   _dkms_dir="$pkgdir/usr/src/hp-omen-extra-${pkgver}"
