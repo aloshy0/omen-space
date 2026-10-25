@@ -308,7 +308,11 @@ impl PlatformService {
 
             let (cpu_temp, gpu_temp, battery) = tokio::task::spawn_blocking(move || {
                 let c_temp = cpu_path.as_deref().map(read_temp).unwrap_or(0.0);
-                let g_temp = gpu_path.as_deref().map(read_temp).unwrap_or(0.0);
+                let mut g_temp = gpu_path.as_deref().map(read_temp).unwrap_or(0.0);
+                let dgpu_temp = crate::sysmon::get_safe_gpu_temp();
+                if dgpu_temp > g_temp {
+                    g_temp = dgpu_temp;
+                }
                 let bat = get_battery_info();
                 (c_temp, g_temp, bat)
             }).await.unwrap_or((0.0, 0.0, serde_json::Value::Object(serde_json::Map::new())));

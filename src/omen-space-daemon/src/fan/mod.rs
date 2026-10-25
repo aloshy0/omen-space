@@ -331,7 +331,7 @@ impl FanService {
                 p
             });
 
-            let mut max_temp = 45.0;
+            let mut max_temp = 0.0;
             // 1. Read CPU / motherboard sensors via standard hwmon
             for entry in paths {
                 if let Ok(val_str) = std::fs::read_to_string(entry) {
@@ -353,7 +353,7 @@ impl FanService {
             max_temp
         })
         .await
-        .unwrap_or(45.0)
+        .unwrap_or(0.0)
     }
 
     /// Convert a percentage (0-100) to a PWM duty cycle value (0-255)

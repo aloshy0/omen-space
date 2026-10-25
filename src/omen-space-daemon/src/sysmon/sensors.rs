@@ -33,6 +33,7 @@ pub struct RaplState {
     pub time: std::time::Instant,
 }
 pub static PREV_RAPL: Mutex<Option<RaplState>> = Mutex::new(None);
+#[allow(dead_code)]
 pub static GPU_IDLE_COOLDOWN: Mutex<Option<std::time::Instant>> = Mutex::new(None);
 
 // ── CPU Temperature EWMA Smoother ───────────────────────────────────────────

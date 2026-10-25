@@ -182,51 +182,21 @@ pub fn fetch_system_stats() -> SystemStats {
     let has_nvidia = nvidia_state.is_some();
     let mut nvml_timed_out = false;
 
-    // 1. Check if we are in an intentional quiet window to let the driver sleep
-    let in_cooldown = {
-        let guard = GPU_IDLE_COOLDOWN.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(until) = *guard {
-            std::time::Instant::now() < until
-        } else {
-            false
-        }
-    };
-
-    // 2. If NVIDIA is sleeping (D3cold) OR in cooldown, DO NOT TOUCH NVML OR HWMON AT ALL
-    if has_nvidia && (!is_nvidia_awake || in_cooldown) {
+    // If NVIDIA is sleeping (D3cold), do not touch NVML or hwmon at all
+    if has_nvidia && !is_nvidia_awake {
         stats.gpu_temp = 0;
         stats.gpu_pwr = -1.0;
     } else if is_nvidia_awake {
-        // 3. GPU is active AND cooldown expired. Safe to sample NVML for active processes.
-        let mut has_active_clients = false;
-
+        // GPU is active in D0. Safe to sample NVML.
         if let Some(metrics) = fetch_gpu_metrics_with_timeout() {
-            has_active_clients = metrics.has_clients;
-            if has_active_clients {
-                // Workload running: clear cooldown and stream live metrics
-                {
-                    let mut guard = GPU_IDLE_COOLDOWN.lock().unwrap_or_else(|e| e.into_inner());
-                    *guard = None;
-                }
-
-                if let Some(t) = metrics.temp {
-                    stats.gpu_temp = t;
-                }
-                if let Some(p) = metrics.power {
-                    stats.gpu_pwr = p;
-                }
+            if let Some(t) = metrics.temp {
+                stats.gpu_temp = t;
             }
-        }
-        else {
-            // NVML timed out! The NVIDIA driver is busy/hanging.
-            nvml_timed_out = true; 
-        }
-        if !has_active_clients {
-            // Zero game/render clients detected. Arm 6s quiet window so kernel can suspend.
-            let mut guard = GPU_IDLE_COOLDOWN.lock().unwrap_or_else(|e| e.into_inner());
-            *guard = Some(std::time::Instant::now() + std::time::Duration::from_secs(6));
-            stats.gpu_temp = 0;
-            stats.gpu_pwr = -1.0;
+            if let Some(p) = metrics.power {
+                stats.gpu_pwr = p;
+            }
+        } else {
+            nvml_timed_out = true;
         }
     }
 
