@@ -151,6 +151,23 @@ impl FanService {
         });
     }
 
+    /// Restore hardware EC automatic fan control (pwm1_enable = 2) before daemon exit.
+    /// This cancels hp_wmi's kernel keep-alive workqueue so fans can never remain
+    /// locked at 0 RPM if the daemon stops or restarts.
+    pub async fn restore_ec_on_shutdown(&self) {
+        let state = self.state.lock().await;
+        if let Some(ref hwmon) = state.hwmon_path {
+            let pwm_enable_path = hwmon.join("pwm1_enable");
+            if sysfs_exists(&pwm_enable_path).await {
+                if sysfs_write(&pwm_enable_path, "2").await {
+                    info!("Shutdown safety: restored hardware EC fan control (pwm1_enable=2)");
+                } else {
+                    warn!("Shutdown safety: failed to restore pwm1_enable=2");
+                }
+            }
+        }
+    }
+
 
     async fn _find_hwmon() -> Option<PathBuf> {
         if let Ok(entries) = glob("/sys/class/hwmon/hwmon*/name") {
@@ -408,6 +425,7 @@ impl FanService {
         }
 
         // For pct < 100: Manual PWM control (pwm1_enable = 1)
+        let mut mode_changed = false;
         if sysfs_exists(&pwm_enable_path).await {
             let current = sysfs_read(&pwm_enable_path, 2).await;
             if current != 1 {
@@ -417,16 +435,19 @@ impl FanService {
                     tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
                 }
                 let _ = sysfs_write(&pwm_enable_path, "1").await;
+                mode_changed = true;
             }
         }
 
-        // For performance mode, keep a continuous active floor (40%).
-        // For auto mode, when pct > 0, ensure at least 35% to prevent motor stall,
-        // but preserve pct == 0 so the fans can completely turn off when the device is cool.
-        let effective_pct = if state.mode == "performance" && pct < 40 {
+        // Enforce safe motor operating band:
+        // - 0% -> cleanly OFF (duty = 0, zero current)
+        // - Performance mode -> always active (>= 45%)
+        // - Any non-zero speed -> at least 40% (duty >= 102, ~2400 RPM) to prevent
+        //   under-driven fan motor stall and coil overheating on HP Victus/OMEN hardware.
+        let effective_pct = if state.mode == "performance" && pct < 45 {
+            45
+        } else if pct > 0 && pct < 40 {
             40
-        } else if state.mode == "auto" && pct > 0 && pct < 35 {
-            35
         } else {
             pct
         };
@@ -434,13 +455,13 @@ impl FanService {
         let duty = if effective_pct == 0 {
             0
         } else {
-            let d = Self::pct_to_pwm(effective_pct);
-            if d > 0 && d < 50 { 50 } else { d }
+            Self::pct_to_pwm(effective_pct).max(102)
         };
 
-        // Prevent I/O flooding: only write if duty changed or 10 seconds elapsed
-        let should_write = state.last_written_duty != Some(duty) || 
-            state.last_written_duty_time.is_none_or(|t| now.duration_since(t).as_secs() >= 10);
+        // Prevent I/O flooding: write immediately on mode or duty change, or every 10s as keep-alive
+        let should_write = mode_changed
+            || state.last_written_duty != Some(duty)
+            || state.last_written_duty_time.is_none_or(|t| now.duration_since(t).as_secs() >= 10);
 
         if !should_write {
             return true;
@@ -450,7 +471,7 @@ impl FanService {
             state.last_written_duty = Some(duty);
             state.last_written_duty_time = Some(now);
             let max_speed = state.max_speeds.values().max().copied().unwrap_or(6000);
-            let rpm = ((max_speed as f64 * pct as f64) / 100.0).round() as u32;
+            let rpm = ((max_speed as f64 * effective_pct as f64) / 100.0).round() as u32;
             for &fan_num in &state.found_fans.clone() {
                 state.last_targets.insert(fan_num, rpm);
             }
@@ -630,29 +651,30 @@ impl FanService {
                         Self::evaluate_step(&perf_curve, control_temp).round() as u32
                     } else {
                         // Intelligent Zero-RPM Hysteresis:
-                        // - When device is cool (< 40°C), fans turn completely OFF (0 RPM) for quiet operation.
-                        // - Fans turn ON immediately when control_temp >= 48°C (temp.max(smoothed) detects spikes with 0 delay).
-                        // - Once running, fans maintain at least 35% airflow until device is fully cooled below 40°C.
+                        // - Turns ON immediately when control_temp >= 50°C (temp.max(smoothed) detects spikes with 0 delay).
+                        // - Once running, maintains at least 40% (~2400 RPM, safe hardware motor minimum)
+                        //   until both current and smoothed temps cool below 44°C.
+                        // - Below 44°C (after minimum runtime), turns fans cleanly OFF (0 RPM, zero motor current).
                         let auto_curve = vec![
-                            CurvePoint(0.0,  35.0),   
-                            CurvePoint(48.0, 45.0),  
-                            CurvePoint(55.0, 65.0),
+                            CurvePoint(0.0,  40.0),
+                            CurvePoint(50.0, 45.0),
+                            CurvePoint(58.0, 65.0),
                             CurvePoint(65.0, 85.0),
                             CurvePoint(75.0, 100.0),
                         ];
 
                         if !is_fan_on {
-                            if control_temp >= 48.0 {
+                            if control_temp >= 50.0 {
                                 Self::evaluate_step(&auto_curve, control_temp).round() as u32
                             } else {
                                 0
                             }
                         } else {
-                            if control_temp < 40.0 {
+                            if control_temp < 44.0 {
                                 0
                             } else {
                                 let pct = Self::evaluate_step(&auto_curve, control_temp);
-                                (pct.round() as u32).max(35)
+                                (pct.round() as u32).max(40)
                             }
                         }
                     };
@@ -673,8 +695,8 @@ impl FanService {
                     if desired_pct == 0 {
                         if let Some(turned_on_at) = state.auto_fan_activated_at {
                             if turned_on_at.elapsed().as_secs() < AUTO_PEAK_HOLD_SECS {
-                                desired_pct = 35;
-                                state.last_auto_pct = 35;
+                                desired_pct = 40;
+                                state.last_auto_pct = 40;
                             } else {
                                 state.auto_fan_activated_at = None;
                                 state.last_auto_pct = 0;
@@ -742,18 +764,20 @@ impl FanService {
                     }
                     if curve_points.is_empty() {
                         curve_points = vec![
-                            CurvePoint(40.0, 35.0),
+                            CurvePoint(44.0, 0.0),
                             CurvePoint(50.0, 45.0),
-                            CurvePoint(65.0, 70.0),
-                            CurvePoint(75.0, 90.0),
-                            CurvePoint(80.0, 100.0),
+                            CurvePoint(60.0, 65.0),
+                            CurvePoint(70.0, 85.0),
+                            CurvePoint(75.0, 100.0),
                         ];
                     }
                     
                     if !curve_points.is_empty() {
                         curve_points.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
                         let pct = Self::evaluate_spline(&curve_points, control_temp);
-                        let target_pct = (pct.round() as u32).clamp(30, 100);
+                        let raw_pct = pct.round() as u32;
+                        // Allow clean 0% stop, otherwise enforce >= 40% safe motor floor
+                        let target_pct = if raw_pct == 0 { 0 } else { raw_pct.clamp(40, 100) };
                         
                         let mut state = self.state.lock().await;
                         Self::write_pwm_duty(&mut state, target_pct).await;
@@ -1202,20 +1226,20 @@ mod tests {
     #[test]
     fn test_auto_curve_safe_baseline_and_ramp() {
         let auto_curve = vec![
-            CurvePoint(0.0,  35.0),   
-            CurvePoint(48.0, 45.0),  
-            CurvePoint(55.0, 65.0),
+            CurvePoint(0.0,  40.0),
+            CurvePoint(50.0, 45.0),
+            CurvePoint(58.0, 65.0),
             CurvePoint(65.0, 85.0),
             CurvePoint(75.0, 100.0),
         ];
 
-        // Below 48°C when active: maintains minimum 35%
-        assert_eq!(FanService::evaluate_step(&auto_curve, 0.0), 35.0);
-        assert_eq!(FanService::evaluate_step(&auto_curve, 44.0), 35.0);
+        // Below 50°C when active: maintains safe 40% (~2400 RPM) motor floor
+        assert_eq!(FanService::evaluate_step(&auto_curve, 0.0), 40.0);
+        assert_eq!(FanService::evaluate_step(&auto_curve, 44.0), 40.0);
 
         // Responsive scaling
-        assert_eq!(FanService::evaluate_step(&auto_curve, 48.0), 45.0);
-        assert_eq!(FanService::evaluate_step(&auto_curve, 55.0), 65.0);
+        assert_eq!(FanService::evaluate_step(&auto_curve, 50.0), 45.0);
+        assert_eq!(FanService::evaluate_step(&auto_curve, 58.0), 65.0);
         assert_eq!(FanService::evaluate_step(&auto_curve, 65.0), 85.0);
 
         // Emergency / high-load max fan

@@ -120,7 +120,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     });
 
-    std::future::pending::<()>().await;
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    tokio::select! {
+        _ = sigterm.recv() => {
+            info!("Received SIGTERM — restoring hardware EC fan control before exit.");
+        }
+        _ = tokio::signal::ctrl_c() => {
+            info!("Received SIGINT — restoring hardware EC fan control before exit.");
+        }
+    }
+
+    fan_service.restore_ec_on_shutdown().await;
 
     Ok(())
 }
