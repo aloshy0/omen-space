@@ -10,8 +10,8 @@ use crate::notifier::DesktopNotifier;
 use std::sync::OnceLock;
 
 static SENSOR_TEMP_PATHS: OnceLock<Vec<PathBuf>> = OnceLock::new();
-pub const THERMAL_PROTECTION_TRIGGER_TEMP: f64 = 95.0;
-pub const THERMAL_PROTECTION_RECOVER_TEMP: f64 = 82.0;
+pub const THERMAL_PROTECTION_TRIGGER_TEMP: f64 = 85.0;
+pub const THERMAL_PROTECTION_RECOVER_TEMP: f64 = 72.0;
 pub const AUTO_PEAK_HOLD_SECS: u64 = 15;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -118,6 +118,7 @@ impl FanService {
                 hw_mode = match val {
                     0 => "max".to_string(),
                     1 => "custom".to_string(),
+                    2 => "ec".to_string(),
                     _ => "auto".to_string(),
                 };
             }
@@ -251,6 +252,7 @@ impl FanService {
             state.mode = match val {
                 0 => "max".to_string(),
                 1 => "custom".to_string(),
+                2 => "ec".to_string(),
                 _ => "auto".to_string(),
             };
         }
@@ -418,10 +420,18 @@ impl FanService {
             }
         }
 
-        let duty = if pct == 0 {
+        // In automated modes (auto, performance), enforce a safe 30% baseline
+        // so fans never shut off completely and allow heat soak into the chassis.
+        let effective_pct = if (state.mode == "auto" || state.mode == "performance") && pct < 30 {
+            30
+        } else {
+            pct
+        };
+
+        let duty = if effective_pct == 0 {
             0
         } else {
-            let d = Self::pct_to_pwm(pct);
+            let d = Self::pct_to_pwm(effective_pct);
             if d > 0 && d < 50 { 50 } else { d }
         };
 
@@ -482,6 +492,11 @@ impl FanService {
                 let sum: f64 = state.temp_history.iter().sum();
                 sum / state.temp_history.len() as f64
             };
+
+            // Proactive thermal control:
+            // Immediate reaction to rising temperature spikes, while smooth SMA and peak-hold
+            // govern cooling transitions to avoid rapid fan oscillation and hunting.
+            let control_temp = temp.max(smoothed_temp);
 
             let (mode, curve_json, fans, thermal_active, manual_pct) = {
                 let mut state = self.state.lock().await;
@@ -567,20 +582,18 @@ impl FanService {
             match mode.as_str() {
                 "ec" => {
                     // Hardware EC mode (BIOS control).
-                    // Daemon must not write anything. Watchdog will handle it.
+                    // Daemon must not write anything. Hardware / watchdog handles it safely.
                 }
                 "auto" => {
                     // Software Auto mode.
-                    // Fallback to our own balanced curve if no manual target is set.
+                    // Fallback to our balanced safe curve if no manual target is set.
                     if let Some(pct) = manual_pct {
                         let mut state = self.state.lock().await;
                         Self::write_pwm_duty(&mut state, pct).await;
                         continue;
                     }
 
-                    // Smart Hysteresis Logic for Auto Mode: On at 52C, Off at 43C
                     let mut state = self.state.lock().await;
-                    let is_fan_on = state.auto_fan_activated_at.is_some();
                     
                     // Check if current system power profile is "performance"
                     let is_performance_power = {
@@ -603,50 +616,34 @@ impl FanService {
                     }
 
                     let mut desired_pct = if is_performance_power {
-                        // Step-based aggressive curve for stability
+                        // Aggressive step-based curve for performance power mode
                         let perf_curve = vec![
-                            CurvePoint(0.0,  40.0),
-                            CurvePoint(50.0, 55.0),
-                            CurvePoint(60.0, 75.0),
-                            CurvePoint(75.0, 85.0),
-                            CurvePoint(85.0, 100.0),
+                            CurvePoint(0.0,  45.0),
+                            CurvePoint(50.0, 65.0),
+                            CurvePoint(60.0, 80.0),
+                            CurvePoint(70.0, 100.0),
                         ];
-                        // When in performance power mode, we don't turn off the fans.
-                        Self::evaluate_step(&perf_curve, smoothed_temp).round() as u32
+                        Self::evaluate_step(&perf_curve, control_temp).round() as u32
                     } else {
-                        // Standard Auto curve (Step-based)
+                        // Safe Auto curve:
+                        // Maintains a whisper-quiet 35% baseline (~2100 RPM) at idle to prevent
+                        // thermal soak into the chassis, hinges, and display cable, ramping aggressively
+                        // as temperatures climb to prevent overheating.
                         let auto_curve = vec![
-                            CurvePoint(0.0,  0.0),   
-                            CurvePoint(50.0, 40.0),  
-                            CurvePoint(60.0, 55.0),
-                            CurvePoint(75.0, 75.0),
-                            CurvePoint(85.0, 100.0),
+                            CurvePoint(0.0,  35.0),   
+                            CurvePoint(45.0, 45.0),  
+                            CurvePoint(55.0, 60.0),
+                            CurvePoint(65.0, 80.0),
+                            CurvePoint(75.0, 100.0),
                         ];
-
-                        if !is_fan_on {
-                            if smoothed_temp >= 52.0 {
-                                let pct = Self::evaluate_step(&auto_curve, smoothed_temp);
-                                pct.round() as u32
-                            } else {
-                                0
-                            }
-                        } else {
-                            if smoothed_temp < 43.0 {
-                                0
-                            } else {
-                                let pct = Self::evaluate_step(&auto_curve, smoothed_temp);
-                                (pct.round() as u32).max(40) // Enforce minimum fan speed while ON
-                            }
-                        }
+                        Self::evaluate_step(&auto_curve, control_temp).round() as u32
                     };
 
-                    // 1. Peak Holding
+                    // 1. Peak Holding: immediate increase, hold peak on drop
                     if desired_pct > state.last_auto_pct {
-                        // Immediate increase
                         state.last_auto_pct = desired_pct;
                         state.last_auto_pct_time = std::time::Instant::now();
                     } else if desired_pct < state.last_auto_pct {
-                        // Decrease requested, hold peak briefly for thermal stability
                         if state.last_auto_pct_time.elapsed().as_secs() < AUTO_PEAK_HOLD_SECS {
                             desired_pct = state.last_auto_pct;
                         } else {
@@ -654,22 +651,8 @@ impl FanService {
                         }
                     }
 
-                    // 2. Minimum Runtime (AUTO_PEAK_HOLD_SECS)
-                    if desired_pct == 0 {
-                        if let Some(turned_on_at) = state.auto_fan_activated_at {
-                            if turned_on_at.elapsed().as_secs() < AUTO_PEAK_HOLD_SECS {
-                                desired_pct = 38;
-                                state.last_auto_pct = 38;
-                            } else {
-                                state.auto_fan_activated_at = None;
-                                state.last_auto_pct = 0;
-                            }
-                        }
-                    } else {
-                        // Fan is running
-                        if state.auto_fan_activated_at.is_none() {
-                            state.auto_fan_activated_at = Some(std::time::Instant::now());
-                        }
+                    if state.auto_fan_activated_at.is_none() {
+                        state.auto_fan_activated_at = Some(std::time::Instant::now());
                     }
 
                     Self::write_pwm_duty(&mut state, desired_pct).await;
@@ -685,16 +668,15 @@ impl FanService {
                         continue;
                     }
 
-                    // Step-based aggressive curve for stability
+                    // Aggressive curve for performance mode
                     let perf_curve = vec![
-                        CurvePoint(0.0,  40.0),
-                        CurvePoint(50.0, 55.0),
-                        CurvePoint(60.0, 75.0),
-                        CurvePoint(75.0, 85.0),
-                        CurvePoint(85.0, 100.0),
+                        CurvePoint(0.0,  45.0),
+                        CurvePoint(50.0, 65.0),
+                        CurvePoint(60.0, 80.0),
+                        CurvePoint(70.0, 100.0),
                     ];
                     
-                    let mut desired_pct = Self::evaluate_step(&perf_curve, smoothed_temp).round() as u32;
+                    let mut desired_pct = Self::evaluate_step(&perf_curve, control_temp).round() as u32;
 
                     let mut state = self.state.lock().await;
 
@@ -729,18 +711,18 @@ impl FanService {
                     }
                     if curve_points.is_empty() {
                         curve_points = vec![
-                            CurvePoint(40.0, 0.0),
-                            CurvePoint(50.0, 30.0),
-                            CurvePoint(65.0, 60.0),
-                            CurvePoint(75.0, 85.0),
-                            CurvePoint(85.0, 100.0),
+                            CurvePoint(40.0, 35.0),
+                            CurvePoint(50.0, 45.0),
+                            CurvePoint(65.0, 70.0),
+                            CurvePoint(75.0, 90.0),
+                            CurvePoint(80.0, 100.0),
                         ];
                     }
                     
                     if !curve_points.is_empty() {
                         curve_points.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-                        let pct = Self::evaluate_spline(&curve_points, smoothed_temp);
-                        let target_pct = (pct.round() as u32).clamp(0, 100);
+                        let pct = Self::evaluate_spline(&curve_points, control_temp);
+                        let target_pct = (pct.round() as u32).clamp(30, 100);
                         
                         let mut state = self.state.lock().await;
                         Self::write_pwm_duty(&mut state, target_pct).await;
@@ -1160,8 +1142,8 @@ mod tests {
 
     #[test]
     fn test_thermal_protection_constants() {
-        assert!(THERMAL_PROTECTION_TRIGGER_TEMP >= 95.0, "Trigger must protect at critical temp");
-        assert!(THERMAL_PROTECTION_RECOVER_TEMP <= 85.0, "Recover must allow normal operation");
+        assert!(THERMAL_PROTECTION_TRIGGER_TEMP <= 88.0 && THERMAL_PROTECTION_TRIGGER_TEMP >= 80.0, "Trigger must protect before critical temp");
+        assert!(THERMAL_PROTECTION_RECOVER_TEMP <= 75.0, "Recover must allow safe cooldown");
         assert!(THERMAL_PROTECTION_TRIGGER_TEMP > THERMAL_PROTECTION_RECOVER_TEMP, "Trigger must be higher than recover");
         assert_eq!(AUTO_PEAK_HOLD_SECS, 15, "Peak hold must be responsive");
     }
@@ -1184,5 +1166,40 @@ mod tests {
         // Interpolated point: midpoint of (50.0, 30.0) and (65.0, 60.0) is 57.5°C -> 45.0%
         let mid = FanService::evaluate_spline(&points, 57.5);
         assert!((mid - 45.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_auto_curve_safe_baseline_and_ramp() {
+        let auto_curve = vec![
+            CurvePoint(0.0,  35.0),   
+            CurvePoint(45.0, 45.0),  
+            CurvePoint(55.0, 60.0),
+            CurvePoint(65.0, 80.0),
+            CurvePoint(75.0, 100.0),
+        ];
+
+        // Safe baseline: must never shut off fans to 0 at idle
+        assert!(FanService::evaluate_step(&auto_curve, 0.0) >= 35.0);
+        assert!(FanService::evaluate_step(&auto_curve, 30.0) >= 35.0);
+        assert!(FanService::evaluate_step(&auto_curve, 44.0) >= 35.0);
+
+        // Responsive scaling
+        assert_eq!(FanService::evaluate_step(&auto_curve, 45.0), 45.0);
+        assert_eq!(FanService::evaluate_step(&auto_curve, 55.0), 60.0);
+        assert_eq!(FanService::evaluate_step(&auto_curve, 65.0), 80.0);
+
+        // Emergency / high-load max fan
+        assert_eq!(FanService::evaluate_step(&auto_curve, 75.0), 100.0);
+        assert_eq!(FanService::evaluate_step(&auto_curve, 85.0), 100.0);
+    }
+
+    #[test]
+    fn test_board_8a3d_detected() {
+        let caps = crate::capabilities::detect("8A3D", "", "AMD Ryzen 5 5600H");
+        assert_eq!(caps.product_id, "8A3D");
+        assert_eq!(caps.family, "Victus");
+        assert!(caps.min_fan_speed_percent >= 30, "Must enforce minimum safe fan speed");
+        assert!(!caps.supports_undervolt, "AMD Cezanne does not support Intel undervolt");
+        assert_eq!(caps.fan_zone_count, 2);
     }
 }
