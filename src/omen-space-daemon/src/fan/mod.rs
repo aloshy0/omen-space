@@ -420,10 +420,13 @@ impl FanService {
             }
         }
 
-        // In automated modes (auto, performance), enforce a safe 30% baseline
-        // so fans never shut off completely and allow heat soak into the chassis.
-        let effective_pct = if (state.mode == "auto" || state.mode == "performance") && pct < 30 {
-            30
+        // For performance mode, keep a continuous active floor (40%).
+        // For auto mode, when pct > 0, ensure at least 35% to prevent motor stall,
+        // but preserve pct == 0 so the fans can completely turn off when the device is cool.
+        let effective_pct = if state.mode == "performance" && pct < 40 {
+            40
+        } else if state.mode == "auto" && pct > 0 && pct < 35 {
+            35
         } else {
             pct
         };
@@ -594,6 +597,7 @@ impl FanService {
                     }
 
                     let mut state = self.state.lock().await;
+                    let is_fan_on = state.auto_fan_activated_at.is_some();
                     
                     // Check if current system power profile is "performance"
                     let is_performance_power = {
@@ -616,7 +620,7 @@ impl FanService {
                     }
 
                     let mut desired_pct = if is_performance_power {
-                        // Aggressive step-based curve for performance power mode
+                        // Aggressive step-based curve for performance power mode (fans stay active)
                         let perf_curve = vec![
                             CurvePoint(0.0,  45.0),
                             CurvePoint(50.0, 65.0),
@@ -625,18 +629,32 @@ impl FanService {
                         ];
                         Self::evaluate_step(&perf_curve, control_temp).round() as u32
                     } else {
-                        // Safe Auto curve:
-                        // Maintains a whisper-quiet 35% baseline (~2100 RPM) at idle to prevent
-                        // thermal soak into the chassis, hinges, and display cable, ramping aggressively
-                        // as temperatures climb to prevent overheating.
+                        // Intelligent Zero-RPM Hysteresis:
+                        // - When device is cool (< 40°C), fans turn completely OFF (0 RPM) for quiet operation.
+                        // - Fans turn ON immediately when control_temp >= 48°C (temp.max(smoothed) detects spikes with 0 delay).
+                        // - Once running, fans maintain at least 35% airflow until device is fully cooled below 40°C.
                         let auto_curve = vec![
                             CurvePoint(0.0,  35.0),   
-                            CurvePoint(45.0, 45.0),  
-                            CurvePoint(55.0, 60.0),
-                            CurvePoint(65.0, 80.0),
+                            CurvePoint(48.0, 45.0),  
+                            CurvePoint(55.0, 65.0),
+                            CurvePoint(65.0, 85.0),
                             CurvePoint(75.0, 100.0),
                         ];
-                        Self::evaluate_step(&auto_curve, control_temp).round() as u32
+
+                        if !is_fan_on {
+                            if control_temp >= 48.0 {
+                                Self::evaluate_step(&auto_curve, control_temp).round() as u32
+                            } else {
+                                0
+                            }
+                        } else {
+                            if control_temp < 40.0 {
+                                0
+                            } else {
+                                let pct = Self::evaluate_step(&auto_curve, control_temp);
+                                (pct.round() as u32).max(35)
+                            }
+                        }
                     };
 
                     // 1. Peak Holding: immediate increase, hold peak on drop
@@ -651,8 +669,21 @@ impl FanService {
                         }
                     }
 
-                    if state.auto_fan_activated_at.is_none() {
-                        state.auto_fan_activated_at = Some(std::time::Instant::now());
+                    // 2. Minimum Runtime (AUTO_PEAK_HOLD_SECS) before turning completely off
+                    if desired_pct == 0 {
+                        if let Some(turned_on_at) = state.auto_fan_activated_at {
+                            if turned_on_at.elapsed().as_secs() < AUTO_PEAK_HOLD_SECS {
+                                desired_pct = 35;
+                                state.last_auto_pct = 35;
+                            } else {
+                                state.auto_fan_activated_at = None;
+                                state.last_auto_pct = 0;
+                            }
+                        }
+                    } else {
+                        if state.auto_fan_activated_at.is_none() {
+                            state.auto_fan_activated_at = Some(std::time::Instant::now());
+                        }
                     }
 
                     Self::write_pwm_duty(&mut state, desired_pct).await;
@@ -1172,21 +1203,20 @@ mod tests {
     fn test_auto_curve_safe_baseline_and_ramp() {
         let auto_curve = vec![
             CurvePoint(0.0,  35.0),   
-            CurvePoint(45.0, 45.0),  
-            CurvePoint(55.0, 60.0),
-            CurvePoint(65.0, 80.0),
+            CurvePoint(48.0, 45.0),  
+            CurvePoint(55.0, 65.0),
+            CurvePoint(65.0, 85.0),
             CurvePoint(75.0, 100.0),
         ];
 
-        // Safe baseline: must never shut off fans to 0 at idle
-        assert!(FanService::evaluate_step(&auto_curve, 0.0) >= 35.0);
-        assert!(FanService::evaluate_step(&auto_curve, 30.0) >= 35.0);
-        assert!(FanService::evaluate_step(&auto_curve, 44.0) >= 35.0);
+        // Below 48°C when active: maintains minimum 35%
+        assert_eq!(FanService::evaluate_step(&auto_curve, 0.0), 35.0);
+        assert_eq!(FanService::evaluate_step(&auto_curve, 44.0), 35.0);
 
         // Responsive scaling
-        assert_eq!(FanService::evaluate_step(&auto_curve, 45.0), 45.0);
-        assert_eq!(FanService::evaluate_step(&auto_curve, 55.0), 60.0);
-        assert_eq!(FanService::evaluate_step(&auto_curve, 65.0), 80.0);
+        assert_eq!(FanService::evaluate_step(&auto_curve, 48.0), 45.0);
+        assert_eq!(FanService::evaluate_step(&auto_curve, 55.0), 65.0);
+        assert_eq!(FanService::evaluate_step(&auto_curve, 65.0), 85.0);
 
         // Emergency / high-load max fan
         assert_eq!(FanService::evaluate_step(&auto_curve, 75.0), 100.0);
